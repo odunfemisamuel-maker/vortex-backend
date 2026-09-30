@@ -1,0 +1,315 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum IntentState {
+  open
+  accepted
+  filled
+  cancelled
+  expired
+  slashed
+}
+
+enum SupportedChain {
+  stellar
+  ethereum
+  base
+  polygon
+  arbitrum
+  optimism
+  avalanche
+}
+
+enum FillVerificationState {
+  pending
+  verified
+  rejected
+}
+
+// ---------------------------------------------------------------------------
+// Intent (issue #427: partial fill fields added)
+// ---------------------------------------------------------------------------
+
+model Intent {
+  id                     String                @id @default(uuid())
+  intentId               String                @unique @map("intent_id")
+  user                   String
+  srcChain               SupportedChain        @map("src_chain")
+  srcToken               Json                  @map("src_token")
+  srcAmount              String                @map("src_amount")
+  dstToken               Json                  @map("dst_token")
+  minDstAmount           String                @map("min_dst_amount")
+  quotedDstAmount        String?               @map("quoted_dst_amount")
+  solver                 String?
+  state                  IntentState           @default(open)
+  createdAt              Int                   @map("created_at")
+  deadline               Int
+  filledAt               Int?                  @map("filled_at")
+  fillAmount             String?               @map("fill_amount")
+  txHash                 String?               @unique @map("tx_hash")
+  slashedAt              Int?                  @map("slashed_at")
+  slashReason            String?               @map("slash_reason")
+  paramsVersion          Int?                  @map("params_version")
+  version                Int                   @default(0)
+  fillVerificationState  FillVerificationState? @map("fill_verification_state")
+  fillVerificationReason String?               @map("fill_verification_reason")
+  fillVerifiedAt         DateTime?             @map("fill_verified_at")
+
+  // ── Partial-fill fields (issue #427) ─────────────────────────────────────
+  /// Whether this intent accepts multiple partial fills.
+  allowPartialFill  Boolean @default(false) @map("allow_partial_fill")
+  /// Minimum acceptable amount per single-tranche fill (dst token units).
+  minFillAmount     String? @map("min_fill_amount")
+  /// Running sum of all confirmed fills (dst token units).
+  filledAmount      String  @default("0") @map("filled_amount")
+  /// Remaining amount = minDstAmount - filledAmount (dst token units).
+  remainingAmount   String? @map("remaining_amount")
+
+  // ── Relations ──────────────────────────────────────────────────────────────
+  auditLog  IntentAuditLog[] @relation("IntentAuditLog")
+  fills     IntentFill[]     @relation("IntentFills")
+
+  @@index([user], name: "intents_user_idx")
+  @@index([state], name: "intents_state_idx")
+  @@index([solver], name: "intents_solver_idx")
+  @@index([allowPartialFill, state], name: "intents_partial_fill_state_idx")
+  @@map("intents")
+}
+
+// ---------------------------------------------------------------------------
+// Per-tranche fill record (issue #427)
+// ---------------------------------------------------------------------------
+
+/// One fill record per solver-tranche for a partial-fill intent.
+/// For non-partial intents exactly one row exists after the intent is filled.
+model IntentFill {
+  id             String  @id @default(uuid())
+  fillId         String  @unique @map("fill_id")
+  intentId       String  @map("intent_id")
+  solver         String
+  /// Amount delivered in this fill (dst token smallest units).
+  fillAmount     String  @map("fill_amount")
+  /// Amount of srcAmount reserved when the solver accepted this tranche.
+  reservedAmount String  @map("reserved_amount")
+  txHash         String  @unique @map("tx_hash")
+  filledAt       Int     @map("filled_at")
+
+  intent Intent @relation("IntentFills", fields: [intentId], references: [intentId], onDelete: Cascade)
+
+  @@index([intentId], name: "intent_fills_intent_idx")
+  @@index([solver], name: "intent_fills_solver_idx")
+  @@map("intent_fills")
+}
+
+// ---------------------------------------------------------------------------
+// Audit log
+// ---------------------------------------------------------------------------
+
+model IntentAuditLog {
+  id        BigInt   @id @default(autoincrement())
+  intentId  String   @map("intent_id")
+  timestamp DateTime @default(now())
+  toState   String   @map("to_state")
+  actor     String
+  reason    String
+  metadata  Json?
+
+  intent Intent @relation("IntentAuditLog", fields: [intentId], references: [intentId], onDelete: Cascade)
+
+  @@index([intentId, timestamp(sort: Asc)], name: "audit_log_intent_idx")
+  @@map("intent_audit_log")
+}
+
+// ---------------------------------------------------------------------------
+// Solvers
+// ---------------------------------------------------------------------------
+
+model Solver {
+  id              String   @id @default(uuid())
+  address         String   @unique
+  name            String
+  bondAmount      String   @map("bond_amount")
+  fillsCompleted  Int      @default(0) @map("fills_completed")
+  fillsFailed     Int      @default(0) @map("fills_failed")
+  totalVolume     String   @default("0") @map("total_volume")
+  avgFillTime     Float    @default(0) @map("avg_fill_time")
+  isActive        Boolean  @default(true) @map("is_active")
+  registeredAt    Int      @map("registered_at")
+  supportedChains Json     @map("supported_chains")
+  supportedTokens Json     @map("supported_tokens")
+  lastActiveAt    DateTime? @map("last_active_at")
+
+  @@index([isActive], name: "solvers_is_active_idx")
+  @@map("solvers")
+}
+
+// ---------------------------------------------------------------------------
+// Tokens
+// ---------------------------------------------------------------------------
+
+enum TokenRegistryStatus {
+  active
+  delisted
+  pending_review
+}
+
+model Token {
+  id        String               @id @default(uuid())
+  address   String
+  symbol    String
+  name      String
+  decimals  Int
+  chain     SupportedChain
+  logoUri   String?              @map("logo_uri")
+  priceUsd  Float?               @map("price_usd")
+  isStellar Boolean              @default(false) @map("is_stellar")
+  status    TokenRegistryStatus  @default(active)
+
+  @@unique([address, chain])
+  @@index([chain], name: "tokens_chain_idx")
+  @@index([symbol], name: "tokens_symbol_idx")
+  @@map("tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Pending slashes
+// ---------------------------------------------------------------------------
+
+model PendingSlash {
+  id            String   @id @default(uuid())
+  intentId      String   @map("intent_id")
+  solverAddress String   @map("solver_address")
+  fillDeadline  Int      @map("fill_deadline")
+  detectedAt    Int      @map("detected_at")
+  state         String   @default("challenge_window")
+  challengeEndsAt DateTime @map("challenge_ends_at")
+
+  @@index([solverAddress], name: "pending_slashes_solver_idx")
+  @@index([state], name: "pending_slashes_state_idx")
+  @@map("pending_slashes")
+}
+
+// ---------------------------------------------------------------------------
+// Signature nonces
+// ---------------------------------------------------------------------------
+
+model SignatureNonce {
+  id        String   @id @default(uuid())
+  nonce     String   @unique
+  usedAt    DateTime @default(now()) @map("used_at")
+  expiresAt DateTime @map("expires_at")
+
+  @@index([nonce], name: "signature_nonces_nonce_idx")
+  @@index([expiresAt], name: "signature_nonces_expires_at_idx")
+  @@map("signature_nonces")
+}
+
+// ---------------------------------------------------------------------------
+// API credentials
+// ---------------------------------------------------------------------------
+
+model ApiCredential {
+  id        String   @id @default(uuid())
+  keyHash   String   @unique @map("key_hash")
+  name      String
+  scopes    Json     @default("[]")
+  createdAt DateTime @default(now()) @map("created_at")
+  expiresAt DateTime? @map("expires_at")
+  isActive  Boolean  @default(true) @map("is_active")
+
+  @@index([keyHash], name: "api_credentials_key_hash_idx")
+  @@map("api_credentials")
+}
+
+// ---------------------------------------------------------------------------
+// Feature flags / killswitch
+// ---------------------------------------------------------------------------
+
+model KillSwitch {
+  id          String   @id @default(uuid())
+  scope       String
+  chain       String?
+  token       String?
+  operation   String?
+  active      Boolean  @default(false)
+  reasonCode  String   @map("reason_code")
+  reason      String
+  activatedBy String   @map("activated_by")
+  updatedAt   Int      @map("updated_at")
+
+  @@index([scope, active], name: "killswitch_scope_active_idx")
+  @@map("killswitch")
+}
+
+// ---------------------------------------------------------------------------
+// Onchain outbox
+// ---------------------------------------------------------------------------
+
+enum OutboxEntryState {
+  pending
+  submitted
+  confirmed
+  failed
+}
+
+model OutboxEntry {
+  id          String           @id @default(uuid())
+  intentId    String           @map("intent_id")
+  operation   String
+  payload     Json
+  state       OutboxEntryState @default(pending)
+  attempts    Int              @default(0)
+  createdAt   DateTime         @default(now()) @map("created_at")
+  processedAt DateTime?        @map("processed_at")
+  txHash      String?          @map("tx_hash")
+  error       String?
+
+  @@index([state, createdAt], name: "outbox_state_created_idx")
+  @@index([intentId], name: "outbox_intent_idx")
+  @@map("onchain_outbox")
+}
+
+// ---------------------------------------------------------------------------
+// Fee ledger
+// ---------------------------------------------------------------------------
+
+model FeeLedgerEntry {
+  id        String   @id @default(uuid())
+  intentId  String   @map("intent_id")
+  solver    String
+  feeAmount String   @map("fee_amount")
+  feeBps    Int      @map("fee_bps")
+  token     String
+  chain     String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([intentId], name: "fee_ledger_intent_idx")
+  @@index([solver], name: "fee_ledger_solver_idx")
+  @@map("fee_ledger")
+}
+
+// ---------------------------------------------------------------------------
+// Leader election
+// ---------------------------------------------------------------------------
+
+model LeaderElectionState {
+  workerId   String   @id @map("worker_id")
+  leaderId   String?  @map("leader_id")
+  heartbeat  DateTime @default(now())
+  expiresAt  DateTime @map("expires_at")
+
+  @@map("leader_election")
+}
